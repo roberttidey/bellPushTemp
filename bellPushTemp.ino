@@ -514,7 +514,8 @@ void getFromURL(String url) {
 */
 void actionBellOn() {
 	Serial.println("Bell push detected");
-	ifttt_notify(bellEvent, bellNotify, "", "");
+	if (bellEvent != "-1")
+		ifttt_notify(bellEvent, bellNotify, "", "");
 	if(bellNode != "-1") {
 		easyIOTReport(bellNode, 1, 1);
 	}
