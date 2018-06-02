@@ -1,6 +1,6 @@
 /*
  R. J. Tidey 2017/02/22
- Bell Push detector / notifier to IFTTT
+ Bell Push detector / notifier to pushover or IFTTT
  Can action via a URL like snapshot from a camera
  Also Supports temperature sensors to Easy IoT server.
  Both can be used together if required.
@@ -14,25 +14,32 @@
  modify it under the terms of the GNU General Public License
  version 2 as published by the Free Software Foundation.
  */
+//Uncomment to use IFTTT instead of pushover
+//#define USE_IFTTT
+
 #include <ESP8266WiFi.h>
-#include <WiFiClient.h>
+#include <ESP8266HTTPClient.h>
 #include <ESP8266WebServer.h>
 #include <ESP8266mDNS.h>
 #include <ESP8266HTTPUpdateServer.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
-#include "Base64.h"
-#include <IFTTTMaker.h>
+#ifdef USE_IFTTT
+	#include <IFTTTMaker.h>
+#endif
 #include <WiFiClientSecure.h>
 #include <ArduinoJson.h>
 #include <DNSServer.h>
 #include <WiFiManager.h>
 
+//put -1 s at end
+int unusedPins[11] = {0,2,4,5,12,14,15,16,-1,-1,-1};
+
 /*
 Wifi Manager Web set up
 If WM_NAME defined then use WebManager
 */
-#define WM_NAME "bellPushWebSetup"
+#define WM_NAME "bellPIRWebSetup"
 #define WM_PASSWORD "password"
 #ifdef WM_NAME
 	WiFiManager wifiManager;
@@ -46,10 +53,8 @@ int timeInterval = 50;
 unsigned long elapsedTime;
 unsigned long wifiCheckTime;
 
-#define AP_AUTHID "1234"
-
-//IFTT and request key words
-#define MAKER_KEY "makerkey"
+#define AP_AUTHID "1234567"
+#define AP_SECURITY "?event=zoneSet&auth=12345678"
 
 //For update service
 String host = "esp8266-hall";
@@ -61,6 +66,9 @@ const char* update_password = "password";
 #define EASY_IOT_MASK 1
 #define BOILER_MASK 4
 #define BELL_MASK 8
+#define SECURITY_MASK 16
+#define LIGHTCONTROL_MASK 32
+#define RESET_MASK 64
 int serverMode = 1;
 
 //define BELL_PIN negative to disable
@@ -69,8 +77,31 @@ int serverMode = 1;
 #define BELL_OFF 0
 #define BELL_ON 1
 #define BELL_ACTIONED 2
+// minimum time in mSec to recognise bell edges
+unsigned long  bellIntTime = 0;
+#define BELL_INTTIME_MIN 14
+#define BELL_INTTIME_MAX 26
+// minimum number of bell edges to trigger bell on event
+int bellIntTrigger = 5;
+int bellIntCount = 0;
 int bellState = BELL_OFF;
 unsigned long  bellOnTime = 0;
+
+// Push notifications
+const String NOTIFICATION_APP =  "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzz";
+const String NOTIFICATION_USER = "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzz";  // This can be a group or user
+
+bool isSendPush = false;
+String pushParameters;
+
+//Pins for Reset testing
+#define RESET_PIN 4
+#define PROG_PIN 0
+
+//define SECURITY sensor pin
+#define SECURITY_PIN 5
+int securityState = 0;
+int securityDevice = 0;
 
 #define ONE_WIRE_BUS 13  // DS18B20 pin
 OneWire oneWire(ONE_WIRE_BUS);
@@ -97,37 +128,38 @@ String macAddr;
 
 ESP8266WebServer server(AP_PORT);
 ESP8266HTTPUpdateServer httpUpdater;
-WiFiClient cClient;
-WiFiClientSecure sClient;
-IFTTTMaker ifttt(MAKER_KEY, sClient);
+HTTPClient cClient;
+WiFiClientSecure https;
 
-//Config remote fetch from web page
-#define CONFIG_IP_ADDRESS  "192.168.0.7"
-#define CONFIG_PORT        80
+#ifdef USE_IFTTT
+	//IFTT and request key words
+	#define MAKER_KEY "zzzzzzzzzzzzzzzzzzz"
+	IFTTTMaker ifttt(MAKER_KEY, https);
+#endif
+
+//Config remote fetch from web page, change port in url if needed
+#define CONFIG_IP_ADDRESS  "http://192.168.0.250/espConfig"
 //Comment out for no authorisation else uses same authorisation as EIOT server
 #define CONFIG_AUTH 1
 #define CONFIG_PAGE "espConfig"
 #define CONFIG_RETRIES 10
 
-// EasyIoT server definitions
+// EasyIoT server definitions, change port in url if needed
 #define EIOT_USERNAME    "admin"
 #define EIOT_PASSWORD    "password"
-#define EIOT_IP_ADDRESS  "192.168.0.7"
-#define EIOT_PORT        80
-#define USER_PWD_LEN 40
-char unameenc[USER_PWD_LEN];
+#define EIOT_IP_ADDRESS  "http://192.168.0.250/Api/EasyIoT/Control/Module/Virtual/"
 String eiotNode = "-1";
 String bellNode = "-1";
 String bellEvent = "-1";
 String bellActionURL = "-1";
 String bellNotify = "-1";
 String boilerNode = "-1";
+String securityURL = "-1";
 
 //Action URL access
 //Comment out username if no authentication
 #define ACTION_USERNAME "cam"
 #define ACTION_PASSWORD "password"
-char action_nameenc[USER_PWD_LEN];
 
 //general variables
 float oldTemp, newTemp;
@@ -142,27 +174,62 @@ int boilerOnCount;
   Bell Push interrupt handler
 */
 void ICACHE_RAM_ATTR bellPushInterrupt() {
-	//Ignore any edges unless state is off
-	if (bellState == BELL_OFF)
-		bellState = BELL_ON;
+	unsigned long m = millis();
+	//Ignore fast edges
+	if(((m-bellIntTime) > BELL_INTTIME_MIN) && ((m-bellIntTime) < BELL_INTTIME_MAX)) {
+		//Ignore any edges unless state is off
+		if (bellState == BELL_OFF) {
+			bellIntCount++;
+			bellState = BELL_ON;
+		}
+	}
+	bellIntTime = m;
+}
+
+void ICACHE_RAM_ATTR  delaymSec(unsigned long mSec) {
+	unsigned long ms = mSec;
+	while(ms > 100) {
+		delay(100);
+		ms -= 100;
+		ESP.wdtFeed();
+	}
+	delay(ms);
+	ESP.wdtFeed();
+	yield();
+}
+
+void ICACHE_RAM_ATTR  delayuSec(unsigned long uSec) {
+	unsigned long us = uSec;
+	while(us > 100000) {
+		delay(100);
+		us -= 100000;
+		ESP.wdtFeed();
+	}
+	delayMicroseconds(us);
+	ESP.wdtFeed();
+	yield();
+}
+
+void unusedIO() {
+	int i;
+	
+	for(i=0;i<11;i++) {
+		if(unusedPins[i] < 0) {
+			break;
+		} else if(unusedPins[i] != 16) {
+			pinMode(unusedPins[i],INPUT_PULLUP);
+		} else {
+			pinMode(16,INPUT_PULLDOWN_16);
+		}
+	}
 }
 
 /*
   Set up basic wifi, collect config from flash/server, initiate update server
 */
 void setup() {
+	unusedIO();
 	Serial.begin(115200);
-	char uname[USER_PWD_LEN];
-	String str = String(EIOT_USERNAME)+":"+String(EIOT_PASSWORD);  
-	str.toCharArray(uname, USER_PWD_LEN); 
-	memset(unameenc,0,sizeof(unameenc));
-	base64_encode(unameenc, uname, strlen(uname));
-#ifdef ACTION_USERNAME
-	str = String(ACTION_USERNAME)+":"+String(ACTION_PASSWORD);  
-	str.toCharArray(uname, USER_PWD_LEN); 
-	memset(action_nameenc,0,sizeof(action_nameenc));
-	base64_encode(action_nameenc, uname, strlen(uname));
-#endif
 	Serial.println("Set up Web update service");
 	wifiConnect(0);
 	macAddr = WiFi.macAddress();
@@ -176,12 +243,22 @@ void setup() {
 	server.on("/recent", recentEvents);
 	server.on("/bellPush", testBellPush);
 	server.on("/reloadConfig", reloadConfig);
+	server.on("/resetTest", resetTest);
 	server.begin();
 
 	MDNS.addService("http", "tcp", 80);
 	if(serverMode & BELL_MASK) {
 		pinMode(BELL_PIN, INPUT);
 		attachInterrupt(BELL_PIN, bellPushInterrupt, RISING);
+	}
+	if(serverMode & SECURITY_MASK) {
+		pinMode(SECURITY_PIN, INPUT);
+	}
+	if(serverMode & RESET_MASK) {
+		digitalWrite(RESET_PIN,1);
+		digitalWrite(PROG_PIN,1);
+		pinMode(RESET_PIN, OUTPUT);
+		pinMode(PROG_PIN, OUTPUT);
 	}
 	Serial.println("Set up complete");
 }
@@ -192,14 +269,14 @@ void setup() {
 */
 int wifiConnect(int check) {
 	if(check) {
-		if(WiFi.status() != WL_CONNECTED) {
-			if((elapsedTime - wifiCheckTime) * timeInterval > WIFI_CHECK_TIMEOUT) {
+		if((elapsedTime - wifiCheckTime) * timeInterval > WIFI_CHECK_TIMEOUT) {
+			if(WiFi.status() != WL_CONNECTED) {
 				Serial.println("Wifi connection timed out. Try to relink");
 			} else {
+				wifiCheckTime = elapsedTime;
 				return 1;
 			}
 		} else {
-			wifiCheckTime = elapsedTime;
 			return 0;
 		}
 	}
@@ -209,7 +286,9 @@ int wifiConnect(int check) {
 #ifdef WM_STATIC_IP
 	wifiManager.setSTAStaticIPConfig(IPAddress(WM_STATIC_IP), IPAddress(WM_STATIC_GATEWAY), IPAddress(255,255,255,0));
 #endif
+	wifiManager.setConfigPortalTimeout(180);
 	wifiManager.autoConnect(WM_NAME, WM_PASSWORD);
+	WiFi.mode(WIFI_STA);
 #else
 	Serial.println("Set up manual Web");
 	int retries = 0;
@@ -223,7 +302,7 @@ int wifiConnect(int check) {
 	#endif
 	WiFi.begin(AP_SSID, AP_PASSWORD);
 	while (WiFi.status() != WL_CONNECTED && retries < AP_MAX_WAIT) {
-		delay(1000);
+		delaymSec(1000);
 		Serial.print(".");
 		retries++;
 	}
@@ -245,70 +324,79 @@ int wifiConnect(int check) {
 */
 void getConfig() {
 	int responseOK = 0;
+	int httpCode;
+	int len;
 	int retries = CONFIG_RETRIES;
+	String url = String(CONFIG_IP_ADDRESS);
+	Serial.println("Config url - " + url);
 	String line = "";
 
 	while(retries > 0) {
-		clientConnect(CONFIG_IP_ADDRESS, CONFIG_PORT);
 		Serial.print("Try to GET config data from Server for: ");
 		Serial.println(macAddr);
-
-		cClient.print(String("GET /") + CONFIG_PAGE + " HTTP/1.1\r\n" +
-			"Host: " + String(CONFIG_IP_ADDRESS) + "\r\n" + 
 		#ifdef CONFIG_AUTH
-				"Authorization: Basic " + unameenc + " \r\n" + 
+			cClient.setAuthorization(EIOT_USERNAME, EIOT_PASSWORD);
+		#else
+			cClient.setAuthorization("");		
 		#endif
-			"Content-Length: 0\r\n" + 
-			"Connection: close\r\n" + 
-			"\r\n");
-		int config = 100;
-		int timeout = 0;
-		while (cClient.connected() && timeout < 10){
-			if (cClient.available()) {
-				timeout = 0;
-				line = cClient.readStringUntil('\n');
-				if(line.indexOf("HTTP") == 0 && line.indexOf("200 OK") > 0)
-					responseOK = 1;
-				//Don't bother processing when config complete
-				if (config >= 0) {
-					line.replace("\r","");
-					Serial.println(line);
-					//start reading config when mac address found
-					if (line == macAddr) {
-						config = 0;
-					} else {
-						if(line.charAt(0) != '#') {
-							switch(config) {
-								case 0: host = line;break;
-								case 1: serverMode = line.toInt();break;
-								case 2: eiotNode = line;break;
-								case 3: break; //spare
-								case 4: minMsgInterval = line.toInt();break;
-								case 5:	forceInterval = line.toInt();
-								case 6:	boilerInterval = line.toInt();
-								case 7:	boilerNode = line;
-								case 8: bellNode  = line;break;
-								case 9: bellNotify  = line;break;
-								case 10:bellEvent = line;break;
-								case 11:
-									bellActionURL = line;
-									Serial.println("Config fetched from server OK");
-									config = -100;
-									break;
+		cClient.begin(url);
+		httpCode = cClient.GET();
+		if (httpCode > 0) {
+			if (httpCode == HTTP_CODE_OK) {
+				responseOK = 1;
+				int config = 100;
+				len = cClient.getSize();
+				if (len < 0) len = -10000;
+				Serial.println("Response Size:" + String(len));
+				WiFiClient * stream = cClient.getStreamPtr();
+				while (cClient.connected() && (len > 0 || len <= -10000)) {
+					if(stream->available()) {
+						line = stream->readStringUntil('\n');
+						len -= (line.length() +1 );
+						//Don't bother processing when config complete
+						if (config >= 0) {
+							line.replace("\r","");
+							Serial.println(line);
+							//start reading config when mac address found
+							if (line == macAddr) {
+								config = 0;
+							} else {
+								if(line.charAt(0) != '#') {
+									switch(config) {
+										case 0: host = line;break;
+										case 1: serverMode = line.toInt();break;
+										case 2: eiotNode = line;break;
+										case 3: break; //spare
+										case 4: minMsgInterval = line.toInt();break;
+										case 5:	forceInterval = line.toInt();
+										case 6:	boilerInterval = line.toInt();
+										case 7:	boilerNode = line;
+										case 8: bellNode  = line;break;
+										case 9: bellNotify  = line;break;
+										case 10:bellEvent = line;break;
+										case 11:bellActionURL = line;break;
+										case 12:securityDevice = line.toInt();break;
+										case 13:securityURL = line;break;
+										case 14:
+											bellIntTrigger = line.toInt();
+											Serial.println("Config fetched from server OK");
+											config = -100;
+											break;
+									}
+									config++;
+								}
 							}
-							config++;
 						}
 					}
 				}
-			} else {
-				delay(1000);
-				timeout++;
-				Serial.println("Wait for response");
 			}
+		} else {
+			Serial.printf("[HTTP] POST... failed, error: %s\n", cClient.errorToString(httpCode).c_str());
 		}
-		cClient.stop();
-		if(responseOK == 1)
+		cClient.end();
+		if(responseOK)
 			break;
+		Serial.println("Retrying get config");
 		retries--;
 	}
 	Serial.println();
@@ -324,7 +412,11 @@ void getConfig() {
 	Serial.print("boilerNode:");Serial.println(boilerNode);
 	Serial.print("bellEvent:");Serial.println(bellEvent);
 	Serial.print("bellActionURL:");Serial.println(bellActionURL);
+	Serial.print("securityDevice:");Serial.println(securityDevice);
+	Serial.print("securityURL:");Serial.println(securityURL);
+	Serial.print("bellIntTrigger:");Serial.println(bellIntTrigger);
 }
+
 
 /*
   reload Config
@@ -356,7 +448,11 @@ void recentEvents() {
 		for(int i = 0;i<MAX_RECENT;i++) {
 			if((recentTimes[recent]) >0) {
 				minutes = (elapsedTime - recentTimes[recent]) * timeInterval / 60000;
-				response += "Bell pushed " + String(minutes) + " minutes ago<BR>";
+				if(recentTimes[recent] & 0x01)
+					response += "Security change ";
+				else
+					response += "Bell pushed ";
+				response += String(minutes) + " minutes ago<BR>";
 			}
 			recent--;
 			if(recent < 0) recent = MAX_RECENT - 1;
@@ -386,26 +482,33 @@ void testBellPush() {
 	}
 }
 
-
 /*
-  Establish client connection
+  resetTest
 */
-void clientConnect(char* host, uint16_t port) {
-	int retries = 0;
-   
-	while(!cClient.connect(host, port)) {
-		Serial.print("?");
-		retries++;
-		if(retries > CONFIG_RETRIES) {
-			Serial.print("Client connection failed:" );
-			Serial.println(host);
-			wifiConnect(0); 
-			retries = 0;
-		} else {
-			delay(5000);
+void resetTest() {
+	int resetWidth;
+	int progWidth;
+	if(serverMode & RESET_MASK)	{
+		resetWidth = server.arg("reset").toInt();
+		progWidth = server.arg("prog").toInt();
+		Serial.printf("reset %d prog %d\r\n", resetWidth, progWidth);
+		if(progWidth && progWidth < resetWidth)
+			progWidth = resetWidth;
+		if(progWidth)
+			digitalWrite(PROG_PIN, 0);
+		digitalWrite(RESET_PIN, 0);
+		delayuSec(resetWidth);
+		digitalWrite(RESET_PIN, 1);
+		if(progWidth) {
+			delayuSec(progWidth - resetWidth);
+			digitalWrite(PROG_PIN, 1);
 		}
+		server.send(200, "text/html", "reset-prog sent");
+	} else {
+		server.send(200, "text/html", "reset-prog not active");
 	}
 }
+
 
 /*
   Check if value changed enough to report
@@ -415,6 +518,7 @@ bool checkBound(float newValue, float prevValue, float maxDiff) {
          (newValue < prevValue - maxDiff || newValue > prevValue + maxDiff);
 }
 
+#ifdef USE_IFTTT
 /*
  Send notify trigger to IFTTT
 */
@@ -427,6 +531,44 @@ int ifttt_notify(String eventName, String value1, String value2, String value3) 
 	return 0;
   }
 }
+#endif
+
+/*
+ Start notification to pushover
+*/
+void startPushNotification(String message) {
+	if(isSendPush == false) {
+		// Form the string
+		pushParameters = "token=" + NOTIFICATION_APP + "&user=" + NOTIFICATION_USER + "&message=" + message;
+		isSendPush = true;
+		Serial.println("Connecting to push server");
+		https.connect("api.pushover.net", 443);
+	}
+}
+
+// Keep track of the pushover server connection status without holding 
+// up the code execution, and then send notification
+void updatePushServer(){
+    if(isSendPush == true) {
+		if(https.connected()) {
+			int length = pushParameters.length();
+			Serial.println("Posting push notification: " + pushParameters);
+			https.println("POST /1/messages.json HTTP/1.1");
+			https.println("Host: api.pushover.net");
+			https.println("Connection: close\r\nContent-Type: application/x-www-form-urlencoded");
+			https.print("Content-Length: ");
+			https.print(length);
+			https.println("\r\n");
+			https.print(pushParameters);
+
+			https.stop();
+			isSendPush = false;
+			Serial.println("Finished posting notification.");
+		} else {
+			Serial.println("Not connected.");
+		}
+    }
+}
 
 /*
  Send report to easyIOTReport
@@ -435,37 +577,33 @@ int ifttt_notify(String eventName, String value1, String value2, String value3) 
 void easyIOTReport(String node, float value, int digital) {
 	int retries = CONFIG_RETRIES;
 	int responseOK = 0;
-	String url = "/Api/EasyIoT/Control/Module/Virtual/" + node;
-	
+	int httpCode;
+	String url = String(EIOT_IP_ADDRESS) + node;
 	// generate EasIoT server node URL
 	if(digital == 1) {
 		if(value > 0)
 			url += "/ControlOn";
 		else
 			url += "/ControlOff";
-	} else
+	} else {
 		url += "/ControlLevel/" + String(value);
-
+	}
 	Serial.print("POST data to URL: ");
 	Serial.println(url);
 	while(retries > 0) {
-		clientConnect(EIOT_IP_ADDRESS, EIOT_PORT);
-		cClient.print(String("POST ") + url + " HTTP/1.1\r\n" +
-				"Host: " + String(EIOT_IP_ADDRESS) + "\r\n" + 
-				"Connection: close\r\n" + 
-				"Authorization: Basic " + unameenc + " \r\n" + 
-				"Content-Length: 0\r\n" + 
-				"\r\n");
-
-		delay(100);
-		while(cClient.available()){
-			String line = cClient.readStringUntil('\r');
-			if(line)
-			Serial.print(line);
-			if(line.indexOf("HTTP") == 0 && line.indexOf("200 OK") > 0)
+		cClient.setAuthorization(EIOT_USERNAME, EIOT_PASSWORD);
+		cClient.begin(url);
+		httpCode = cClient.GET();
+		if (httpCode > 0) {
+			if (httpCode == HTTP_CODE_OK) {
+				String payload = cClient.getString();
+				Serial.println(payload);
 				responseOK = 1;
+			}
+		} else {
+			Serial.printf("[HTTP] POST... failed, error: %s\n", cClient.errorToString(httpCode).c_str());
 		}
-		cClient.stop();
+		cClient.end();
 		if(responseOK)
 			break;
 		else
@@ -479,34 +617,35 @@ void easyIOTReport(String node, float value, int digital) {
 /*
  Access a URL
 */
-void getFromURL(String url) {
-	String url_host;
-	uint16_t url_port;
-	char host[32];
-	int portStart, addressStart;
+void getFromURL(String url, int retryCount, char* user, char* password) {
+	int retries = retryCount;
+	int responseOK = 0;
+	int httpCode;
 	
 	Serial.println("get from " + url);
-	portStart = url.indexOf(":");
-	addressStart = url.indexOf("/");
-	if(portStart >=0) {
-		url_port = (url.substring(portStart+1,addressStart)).toInt();
-		url_host = url.substring(0,portStart);
-	} else {
-		url_port = 80;
-		url_host = url.substring(0,addressStart);
-	}
-	strcpy(host, url_host.c_str());
 	
-	clientConnect(host, url_port);
-	cClient.print(String("GET ") + url.substring(addressStart) + " HTTP/1.1\r\n" +
-		   "Host: " + url_host + "\r\n" + 
-#ifdef ACTION_USERNAME
-			"Authorization: Basic " + action_nameenc + " \r\n" + 
-#endif
-		   "Connection: close\r\n" + 
-		   "Content-Length: 0\r\n" + 
-		   "\r\n");
-	cClient.stop();
+	while(retries > 0) {
+		if(user) cClient.setAuthorization(user, password);
+		cClient.begin(url);
+		httpCode = cClient.GET();
+		if (httpCode > 0) {
+			if (httpCode == HTTP_CODE_OK) {
+				String payload = cClient.getString();
+				Serial.println(payload);
+				responseOK = 1;
+			}
+		} else {
+			Serial.printf("[HTTP] POST... failed, error: %s\n", cClient.errorToString(httpCode).c_str());
+		}
+		cClient.end();
+		if(responseOK)
+			break;
+		else
+			Serial.println("Retrying EIOT report");
+		retries--;
+	}
+	Serial.println();
+	Serial.println("Connection closed");
 }
 
 /*
@@ -514,16 +653,22 @@ void getFromURL(String url) {
 */
 void actionBellOn() {
 	Serial.println("Bell push detected");
-	if (bellEvent != "-1")
+	if (bellEvent != "-1") {
+#ifdef USE_IFTTT
 		ifttt_notify(bellEvent, bellNotify, "", "");
+#else
+		startPushNotification(bellEvent);
+#endif
+	}
 	if(bellNode != "-1") {
 		easyIOTReport(bellNode, 1, 1);
 	}
 	if(bellActionURL != "-1") {
-		getFromURL(bellActionURL);
+		getFromURL(bellActionURL, CONFIG_RETRIES, ACTION_USERNAME, ACTION_PASSWORD);
 	}
 	bellOnTime = elapsedTime;
-	recentTimes[recentIndex] = elapsedTime;
+	//even times are bell pushes
+	recentTimes[recentIndex] = elapsedTime & 0xFFFFFFFE;
 	recentIndex++;
 	if(recentIndex >= MAX_RECENT) recentIndex = 0;
 }
@@ -571,16 +716,29 @@ void loop() {
 	}
 	for(int i = minMsgInterval; i > 0;i--){
 		server.handleClient();
+		updatePushServer();
 		forceCounter++;
 		for(int j = 0; j < (1000 / timeInterval);j++) {
+			if(bellState == BELL_OFF) {
+				if(bellIntCount>bellIntTrigger) {
+					 bellState = BELL_ON;
+				} else {
+					//lower bellcount to remove isolated interrupts
+					if(bellIntCount>0) bellIntCount--;
+				}
+			}
 			if(bellState == BELL_ON) {
 				actionBellOn();
 				bellState = BELL_ACTIONED;
+				bellIntCount = 0;
 			} else if(bellState == BELL_ACTIONED && (elapsedTime - bellOnTime) * timeInterval / 1000 > BELL_MIN_INTERVAL) {
 				bellState = BELL_OFF;
 				if(bellNode != "-1") easyIOTReport(bellNode, 0, 1);
 			}
-			delay(timeInterval);
+			//sanitise bellIntCount to stop it going out of range
+			if(bellIntCount < 0 || bellIntCount > bellIntTrigger + 5)
+				bellIntCount=0;
+			delaymSec(timeInterval);
 			elapsedTime++;
 			wifiConnect(1);
 		}
