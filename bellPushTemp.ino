@@ -16,6 +16,7 @@
  */
 //Uncomment to use IFTTT instead of pushover
 //#define USE_IFTTT
+#define ESP8266
 
 #include <ESP8266WiFi.h>
 #include <ESP8266HTTPClient.h>
