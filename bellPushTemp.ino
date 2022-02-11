@@ -17,12 +17,9 @@
 //Uncomment to use IFTTT instead of pushover
 //#define USE_IFTTT
 #define ESP8266
+#include "BaseConfig.h"
 
-#include <ESP8266WiFi.h>
 #include <ESP8266HTTPClient.h>
-#include <ESP8266WebServer.h>
-#include <ESP8266mDNS.h>
-#include <ESP8266HTTPUpdateServer.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
 #ifdef USE_IFTTT
@@ -30,38 +27,9 @@
 #endif
 #include <WiFiClientSecure.h>
 #include <ArduinoJson.h>
-#include <DNSServer.h>
-#include <WiFiManager.h>
-
-//put -1 s at end
-int unusedPins[11] = {0,2,4,5,12,14,15,16,-1,-1,-1};
-
-/*
-Wifi Manager Web set up
-If WM_NAME defined then use WebManager
-*/
-#define WM_NAME "bellPIRWebSetup"
-#define WM_PASSWORD "password"
-#ifdef WM_NAME
-	WiFiManager wifiManager;
-#endif
-//uncomment to use a static IP
-//#define WM_STATIC_IP 192,168,0,100
-//#define WM_STATIC_GATEWAY 192,168,0,1
 
 int timeInterval = 50;
-#define WIFI_CHECK_TIMEOUT 30000
 unsigned long elapsedTime;
-unsigned long wifiCheckTime;
-
-#define AP_AUTHID "1234567"
-#define AP_SECURITY "?event=zoneSet&auth=12345678"
-
-//For update service
-String host = "esp8266-hall";
-const char* update_path = "/firmware";
-const char* update_username = "admin";
-const char* update_password = "password";
 
 //bit mask for server support
 #define EASY_IOT_MASK 1
@@ -87,10 +55,6 @@ int bellIntTrigger = 5;
 int bellIntCount = 0;
 int bellState = BELL_OFF;
 unsigned long  bellOnTime = 0;
-
-// Push notifications
-const String NOTIFICATION_APP =  "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzz";
-const String NOTIFICATION_USER = "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzz";  // This can be a group or user
 
 bool isSendPush = false;
 String pushParameters;
@@ -119,36 +83,28 @@ int minMsgInterval = 10; // in units of 1 second
 int forceInterval = 300; // send message after this interval even if temp same 
 int boilerInterval = 0; // interval for measuring boiler utilisation % Typically 600. 0 is off
 
-//AP definitions
-#define AP_SSID "ssid"
-#define AP_PASSWORD "password"
-#define AP_MAX_WAIT 10
-String macAddr;
-
-#define AP_PORT 80
-
-ESP8266WebServer server(AP_PORT);
-ESP8266HTTPUpdateServer httpUpdater;
 HTTPClient cClient;
 WiFiClientSecure https;
+WiFiClient client;
 
 #ifdef USE_IFTTT
 	//IFTT and request key words
-	#define MAKER_KEY "zzzzzzzzzzzzzzzzzzz"
+	#define MAKER_KEY "bQtjh_Bc7flsHYOYFICC7y"
 	IFTTTMaker ifttt(MAKER_KEY, https);
 #endif
 
-//Config remote fetch from web page, change port in url if needed
-#define CONFIG_IP_ADDRESS  "http://192.168.0.250/espConfig"
+//Config remote fetch from web page
+#define CONFIG_IP_ADDRESS  "http://192.168.0.7/espConfig"
+#define CONFIG_PORT        80
 //Comment out for no authorisation else uses same authorisation as EIOT server
 #define CONFIG_AUTH 1
 #define CONFIG_PAGE "espConfig"
 #define CONFIG_RETRIES 10
 
-// EasyIoT server definitions, change port in url if needed
+// EasyIoT server definitions
 #define EIOT_USERNAME    "admin"
-#define EIOT_PASSWORD    "password"
-#define EIOT_IP_ADDRESS  "http://192.168.0.250/Api/EasyIoT/Control/Module/Virtual/"
+#define EIOT_IP_ADDRESS  "http://192.168.0.7/Api/EasyIoT/Control/Module/Virtual/"
+#define EIOT_PORT        80
 String eiotNode = "-1";
 String bellNode = "-1";
 String bellEvent = "-1";
@@ -156,11 +112,6 @@ String bellActionURL = "-1";
 String bellNotify = "-1";
 String boilerNode = "-1";
 String securityURL = "-1";
-
-//Action URL access
-//Comment out username if no authentication
-#define ACTION_USERNAME "cam"
-#define ACTION_PASSWORD "password"
 
 //general variables
 float oldTemp, newTemp;
@@ -187,139 +138,6 @@ void ICACHE_RAM_ATTR bellPushInterrupt() {
 	bellIntTime = m;
 }
 
-void ICACHE_RAM_ATTR  delaymSec(unsigned long mSec) {
-	unsigned long ms = mSec;
-	while(ms > 100) {
-		delay(100);
-		ms -= 100;
-		ESP.wdtFeed();
-	}
-	delay(ms);
-	ESP.wdtFeed();
-	yield();
-}
-
-void ICACHE_RAM_ATTR  delayuSec(unsigned long uSec) {
-	unsigned long us = uSec;
-	while(us > 100000) {
-		delay(100);
-		us -= 100000;
-		ESP.wdtFeed();
-	}
-	delayMicroseconds(us);
-	ESP.wdtFeed();
-	yield();
-}
-
-void unusedIO() {
-	int i;
-	
-	for(i=0;i<11;i++) {
-		if(unusedPins[i] < 0) {
-			break;
-		} else if(unusedPins[i] != 16) {
-			pinMode(unusedPins[i],INPUT_PULLUP);
-		} else {
-			pinMode(16,INPUT_PULLDOWN_16);
-		}
-	}
-}
-
-/*
-  Set up basic wifi, collect config from flash/server, initiate update server
-*/
-void setup() {
-	unusedIO();
-	Serial.begin(115200);
-	Serial.println("Set up Web update service");
-	wifiConnect(0);
-	macAddr = WiFi.macAddress();
-	macAddr.replace(":","");
-	Serial.println(macAddr);
-	getConfig();
-
-	//Update service
-	MDNS.begin(host.c_str());
-	httpUpdater.setup(&server, update_path, update_username, update_password);
-	server.on("/recent", recentEvents);
-	server.on("/bellPush", testBellPush);
-	server.on("/reloadConfig", reloadConfig);
-	server.on("/resetTest", resetTest);
-	server.begin();
-
-	MDNS.addService("http", "tcp", 80);
-	if(serverMode & BELL_MASK) {
-		pinMode(BELL_PIN, INPUT);
-		attachInterrupt(BELL_PIN, bellPushInterrupt, RISING);
-	}
-	if(serverMode & SECURITY_MASK) {
-		pinMode(SECURITY_PIN, INPUT);
-	}
-	if(serverMode & RESET_MASK) {
-		digitalWrite(RESET_PIN,1);
-		digitalWrite(PROG_PIN,1);
-		pinMode(RESET_PIN, OUTPUT);
-		pinMode(PROG_PIN, OUTPUT);
-	}
-	Serial.println("Set up complete");
-}
-
-/*
-  Connect to local wifi with retries
-  If check is set then test the connection and re-establish if timed out
-*/
-int wifiConnect(int check) {
-	if(check) {
-		if((elapsedTime - wifiCheckTime) * timeInterval > WIFI_CHECK_TIMEOUT) {
-			if(WiFi.status() != WL_CONNECTED) {
-				Serial.println("Wifi connection timed out. Try to relink");
-			} else {
-				wifiCheckTime = elapsedTime;
-				return 1;
-			}
-		} else {
-			return 0;
-		}
-	}
-	wifiCheckTime = elapsedTime;
-#ifdef WM_NAME
-	Serial.println("Set up managed Web");
-#ifdef WM_STATIC_IP
-	wifiManager.setSTAStaticIPConfig(IPAddress(WM_STATIC_IP), IPAddress(WM_STATIC_GATEWAY), IPAddress(255,255,255,0));
-#endif
-	wifiManager.setConfigPortalTimeout(180);
-	wifiManager.autoConnect(WM_NAME, WM_PASSWORD);
-	WiFi.mode(WIFI_STA);
-#else
-	Serial.println("Set up manual Web");
-	int retries = 0;
-	Serial.print("Connecting to AP");
-	#ifdef AP_IP
-		IPAddress addr1(AP_IP);
-		IPAddress addr2(AP_DNS);
-		IPAddress addr3(AP_GATEWAY);
-		IPAddress addr4(AP_SUBNET);
-		WiFi.config(addr1, addr2, addr3, addr4);
-	#endif
-	WiFi.begin(AP_SSID, AP_PASSWORD);
-	while (WiFi.status() != WL_CONNECTED && retries < AP_MAX_WAIT) {
-		delaymSec(1000);
-		Serial.print(".");
-		retries++;
-	}
-	Serial.println("");
-	if(retries < AP_MAX_WAIT) {
-		Serial.print("WiFi connected ip ");
-		Serial.print(WiFi.localIP());
-		Serial.printf(":%d mac %s\r\n", AP_PORT, WiFi.macAddress().c_str());
-		return 1;
-	} else {
-		Serial.println("WiFi connection attempt failed"); 
-		return 0;
-	} 
-#endif
-}
-
 /*
   Get config from server
 */
@@ -335,12 +153,12 @@ void getConfig() {
 	while(retries > 0) {
 		Serial.print("Try to GET config data from Server for: ");
 		Serial.println(macAddr);
+		cClient.begin(client, url);
 		#ifdef CONFIG_AUTH
 			cClient.setAuthorization(EIOT_USERNAME, EIOT_PASSWORD);
 		#else
 			cClient.setAuthorization("");		
 		#endif
-		cClient.begin(url);
 		httpCode = cClient.GET();
 		if (httpCode > 0) {
 			if (httpCode == HTTP_CODE_OK) {
@@ -540,7 +358,7 @@ int ifttt_notify(String eventName, String value1, String value2, String value3) 
 void startPushNotification(String message) {
 	if(isSendPush == false) {
 		// Form the string
-		pushParameters = "token=" + NOTIFICATION_APP + "&user=" + NOTIFICATION_USER + "&message=" + message;
+		pushParameters = "token=" + String(NOTIFICATION_APP) + "&user=" + String(NOTIFICATION_USER) + "&message=" + message;
 		isSendPush = true;
 		Serial.println("Connecting to push server");
 		https.connect("api.pushover.net", 443);
@@ -592,8 +410,8 @@ void easyIOTReport(String node, float value, int digital) {
 	Serial.print("POST data to URL: ");
 	Serial.println(url);
 	while(retries > 0) {
+		cClient.begin(client, url);
 		cClient.setAuthorization(EIOT_USERNAME, EIOT_PASSWORD);
-		cClient.begin(url);
 		httpCode = cClient.GET();
 		if (httpCode > 0) {
 			if (httpCode == HTTP_CODE_OK) {
@@ -626,8 +444,8 @@ void getFromURL(String url, int retryCount, char* user, char* password) {
 	Serial.println("get from " + url);
 	
 	while(retries > 0) {
+		cClient.begin(client, url);
 		if(user) cClient.setAuthorization(user, password);
-		cClient.begin(url);
 		httpCode = cClient.GET();
 		if (httpCode > 0) {
 			if (httpCode == HTTP_CODE_OK) {
@@ -672,6 +490,33 @@ void actionBellOn() {
 	recentTimes[recentIndex] = elapsedTime & 0xFFFFFFFE;
 	recentIndex++;
 	if(recentIndex >= MAX_RECENT) recentIndex = 0;
+}
+
+void setupStart() {
+}
+
+void extraHandlers() {
+	server.on("/recent", recentEvents);
+	server.on("/bellPush", testBellPush);
+	server.on("/reloadConfig", reloadConfig);
+	server.on("/resetTest", resetTest);
+}
+
+void setupEnd() {
+	getConfig();
+	if(serverMode & BELL_MASK) {
+		pinMode(BELL_PIN, INPUT);
+		attachInterrupt(BELL_PIN, bellPushInterrupt, RISING);
+	}
+	if(serverMode & SECURITY_MASK) {
+		pinMode(SECURITY_PIN, INPUT);
+	}
+	if(serverMode & RESET_MASK) {
+		digitalWrite(RESET_PIN,1);
+		digitalWrite(PROG_PIN,1);
+		pinMode(RESET_PIN, OUTPUT);
+		pinMode(PROG_PIN, OUTPUT);
+	}
 }
 
 /*
